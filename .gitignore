@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.env
+streamlit-smoke.out.log
+streamlit-smoke.err.log
+data/conversations/*.json
+data/conversations/*.lock
+data/site_cache/*.json
+data/uploads/files/*
+data/uploads/registry.json
+data/uploads/registry.lock
