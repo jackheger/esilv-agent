@@ -1,6 +1,6 @@
 # ESILV Smart Assistant
 
-Local Streamlit demo for the ESILV Smart Assistant project. This first version includes:
+Local Streamlit app for the ESILV Smart Assistant project. This version includes:
 
 - A single Streamlit app with chat and admin views
 - Persistent multi-conversation history stored as JSON
