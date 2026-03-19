@@ -1,7 +1,10 @@
+import pytest
+
 from app.models import AgentFeatureSettings
 from agents.orchestrator import OrchestratorAgent
 from app.conversation_store import ConversationStore
 from app.models import MessageRecord, RetrievalHit, SearchHit
+from app.registration_store import RegistrationStore
 
 
 class FakeLlmClient:
@@ -9,15 +12,32 @@ class FakeLlmClient:
         self.structured_responses = list(structured_responses)
         self.text_responses = list(text_responses)
         self._configured = configured
+        self.text_calls = []
+        self.structured_calls = []
 
     @property
     def configured(self) -> bool:
         return self._configured
 
     def generate_structured(self, prompt, system_instruction, schema, temperature=0.0):
+        self.structured_calls.append(
+            {
+                "prompt": prompt,
+                "system_instruction": system_instruction,
+                "schema": schema,
+                "temperature": temperature,
+            }
+        )
         return self.structured_responses.pop(0)
 
     def generate_text(self, prompt, system_instruction, temperature=0.2):
+        self.text_calls.append(
+            {
+                "prompt": prompt,
+                "system_instruction": system_instruction,
+                "temperature": temperature,
+            }
+        )
         return self.text_responses.pop(0)
 
 
@@ -83,11 +103,16 @@ def make_orchestrator(
     llm,
     settings: AgentFeatureSettings | None = None,
 ):
+    registration_store = RegistrationStore(
+        store.conversations_dir.parent / "registrations" / "sessions",
+        store.conversations_dir.parent / "registrations" / "submissions",
+    )
     return OrchestratorAgent(
-        store,
-        search,
-        retrieval,
-        llm,
+        conversation_store=store,
+        registration_store=registration_store,
+        search_agent=search,
+        retrieval_agent=retrieval,
+        llm_client=llm,
         feature_settings_store=InMemoryFeatureSettingsStore(settings),
         max_search_hits=5,
     )
@@ -126,9 +151,10 @@ def test_orchestrator_routes_to_search_and_attaches_citations(tmp_path):
 
     assert search.queries == [("ESILV admissions", 5)]
     assert retrieval.queries == []
-    assert response.content == "Admissions answer from sources"
+    assert "Admissions answer from sources" in response.content
     assert response.citations[0].kind == "web"
     assert response.citations[0].url == "https://www.esilv.fr/admissions/"
+    assert response.pending_action == "registration"
     assert len(store.load(conversation.id).messages) == 2
 
 
@@ -458,8 +484,9 @@ def test_orchestrator_runs_hybrid_single_pass_when_both_tools_are_enabled(tmp_pa
 
     assert retrieval.queries == [("How do ESILV admissions work?", 5)]
     assert search.queries == [("How do ESILV admissions work?", 5)]
-    assert response.content == "Hybrid answer from both sources."
+    assert "Hybrid answer from both sources." in response.content
     assert {citation.kind for citation in response.citations} == {"document", "web"}
+    assert response.pending_action == "registration"
 
 
 def test_orchestrator_falls_back_to_web_search_when_retrieval_is_weak(tmp_path):
@@ -495,9 +522,10 @@ def test_orchestrator_falls_back_to_web_search_when_retrieval_is_weak(tmp_path):
 
     assert retrieval.queries == [("How do ESILV admissions work?", 5)]
     assert search.queries == [("How do ESILV admissions work?", 5)]
-    assert response.content == "Admissions answer from sources"
+    assert "Admissions answer from sources" in response.content
     assert response.citations[0].kind == "web"
     assert response.citations[0].url == "https://www.esilv.fr/admissions/"
+    assert response.pending_action == "registration"
 
 
 def test_orchestrator_forces_direct_answer_when_all_tools_are_disabled(tmp_path):
@@ -521,8 +549,9 @@ def test_orchestrator_forces_direct_answer_when_all_tools_are_disabled(tmp_path)
 
     assert search.queries == []
     assert retrieval.queries == []
-    assert response.content == "Direct answer only."
+    assert "Direct answer only." in response.content
     assert response.citations == []
+    assert response.pending_action == "registration"
 
 
 def test_orchestrator_delegates_to_super_agent_for_retrieval_or_search_turns(tmp_path):
@@ -584,3 +613,186 @@ def test_orchestrator_does_not_delegate_direct_turns_to_super_agent(tmp_path):
 
     assert response.content == "Direct answer still used."
     assert dummy_super_agent.calls == []
+
+
+def test_orchestrator_starts_registration_immediately_for_contact_requests(tmp_path):
+    store = ConversationStore(tmp_path / "conversations")
+    conversation = store.create()
+    llm = FakeLlmClient(structured_responses=[], text_responses=[], configured=False)
+    search = FakeSearchAgent([])
+    retrieval = FakeRetrievalAgent([])
+    orchestrator = make_orchestrator(store, search, retrieval, llm)
+
+    response = orchestrator.handle_turn(conversation.id, "Please contact me about ESILV")
+
+    assert "full name" in response.content.lower()
+    assert search.queries == []
+    assert retrieval.queries == []
+    assert orchestrator.registration_agent.registration_store.load_session(conversation.id) is not None
+
+
+def test_orchestrator_starts_registration_after_affirmative_cta_follow_up(tmp_path):
+    store = ConversationStore(tmp_path / "conversations")
+    conversation = store.create()
+    llm = FakeLlmClient(
+        structured_responses=[{"action": "search", "search_query": "ESILV admissions"}],
+        text_responses=["Admissions answer from sources"],
+    )
+    search = FakeSearchAgent(
+        [
+            SearchHit(
+                url="https://www.esilv.fr/admissions/",
+                title="Admissions | ESILV",
+                snippet="Admissions requirements and application steps.",
+                score=9.0,
+                lexical_overlap=0.5,
+                expanded_overlap=0.5,
+                fetched_at="2026-03-19T12:00:00+00:00",
+            )
+        ]
+    )
+    retrieval = FakeRetrievalAgent([])
+    orchestrator = make_orchestrator(
+        store,
+        search,
+        retrieval,
+        llm,
+        settings=AgentFeatureSettings(rag_enabled=False, web_search_enabled=True),
+    )
+
+    first_response = orchestrator.handle_turn(conversation.id, "How do ESILV admissions work?")
+    second_response = orchestrator.handle_turn(conversation.id, "yes")
+
+    assert first_response.pending_action == "registration"
+    assert "full name" in second_response.content.lower()
+    assert orchestrator.registration_agent.registration_store.load_session(conversation.id) is not None
+
+
+def test_orchestrator_routes_active_registration_turns_before_normal_routing(tmp_path):
+    store = ConversationStore(tmp_path / "conversations")
+    conversation = store.create()
+    llm = FakeLlmClient(structured_responses=[], text_responses=[], configured=False)
+    search = FakeSearchAgent([])
+    retrieval = FakeRetrievalAgent([])
+    orchestrator = make_orchestrator(store, search, retrieval, llm)
+
+    orchestrator.handle_turn(conversation.id, "Please contact me about ESILV")
+    response = orchestrator.handle_turn(conversation.id, "Ada Lovelace")
+
+    assert "email" in response.content.lower()
+    assert search.queries == []
+    assert retrieval.queries == []
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "I am interested in joining ESILV",
+        "I am interested in ESILV courses",
+        "I want to join ESILV",
+        "Help me choose courses at ESILV",
+    ],
+)
+def test_orchestrator_immediately_starts_registration_for_lead_intent_phrases(tmp_path, prompt):
+    store = ConversationStore(tmp_path / "conversations")
+    conversation = store.create()
+    llm = FakeLlmClient(structured_responses=[], text_responses=[], configured=False)
+    search = FakeSearchAgent([])
+    retrieval = FakeRetrievalAgent([])
+    orchestrator = make_orchestrator(store, search, retrieval, llm)
+
+    response = orchestrator.handle_turn(conversation.id, prompt)
+
+    assert "full name" in response.content.lower()
+    assert orchestrator.registration_agent.registration_store.load_session(conversation.id) is not None
+    assert search.queries == []
+    assert retrieval.queries == []
+
+
+def test_orchestrator_adds_registration_cta_for_course_discovery_questions(tmp_path):
+    store = ConversationStore(tmp_path / "conversations")
+    conversation = store.create()
+    llm = FakeLlmClient(
+        structured_responses=[{"action": "search", "search_query": "ESILV courses"}],
+        text_responses=["Here are the main ESILV course families."],
+    )
+    search = FakeSearchAgent(
+        [
+            SearchHit(
+                url="https://www.esilv.fr/en/programmes/",
+                title="Programs | ESILV",
+                snippet="Overview of programs and course families.",
+                score=9.0,
+                lexical_overlap=0.4,
+                expanded_overlap=0.4,
+                fetched_at="2026-03-19T12:00:00+00:00",
+            )
+        ]
+    )
+    retrieval = FakeRetrievalAgent([])
+    orchestrator = make_orchestrator(
+        store,
+        search,
+        retrieval,
+        llm,
+        settings=AgentFeatureSettings(rag_enabled=False, web_search_enabled=True),
+    )
+
+    response = orchestrator.handle_turn(conversation.id, "Can you tell me about ESILV courses?")
+
+    assert "Here are the main ESILV course families." in response.content
+    assert response.pending_action == "registration"
+
+
+def test_orchestrator_pins_english_language_for_grounded_answers(tmp_path):
+    store = ConversationStore(tmp_path / "conversations")
+    conversation = store.create()
+    llm = FakeLlmClient(
+        structured_responses=[{"action": "search", "search_query": "ESILV courses"}],
+        text_responses=["English grounded answer."],
+    )
+    search = FakeSearchAgent(
+        [
+            SearchHit(
+                url="https://www.esilv.fr/formations/",
+                title="Formations | ESILV",
+                snippet="Les programmes d'ingenierie et les cours sont presentes ici.",
+                score=9.0,
+                lexical_overlap=0.5,
+                expanded_overlap=0.5,
+                fetched_at="2026-03-19T12:00:00+00:00",
+            )
+        ]
+    )
+    retrieval = FakeRetrievalAgent([])
+    orchestrator = make_orchestrator(
+        store,
+        search,
+        retrieval,
+        llm,
+        settings=AgentFeatureSettings(rag_enabled=False, web_search_enabled=True),
+    )
+
+    response = orchestrator.handle_turn(conversation.id, "What courses does ESILV offer?")
+
+    assert response.content.startswith("English grounded answer.")
+    assert llm.text_calls
+    assert "Required answer language: English." in llm.text_calls[-1]["prompt"]
+    assert "Required response language: English." in llm.text_calls[-1]["system_instruction"]
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("Can you explain ESILV admissions in English?", False),
+        ("Pouvez-vous expliquer les admissions a l'ESILV ?", True),
+    ],
+)
+def test_orchestrator_language_detection_matches_user_query_language(tmp_path, query, expected):
+    store = ConversationStore(tmp_path / "conversations")
+    llm = FakeLlmClient(structured_responses=[], text_responses=[], configured=False)
+    search = FakeSearchAgent([])
+    retrieval = FakeRetrievalAgent([])
+    orchestrator = make_orchestrator(store, search, retrieval, llm)
+
+    assert orchestrator._looks_french(query) is expected

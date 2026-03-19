@@ -61,7 +61,7 @@ class MessageRecord(BaseModel):
     content: str
     timestamp: str = Field(default_factory=utc_now_iso)
     citations: list[CitationRecord] = Field(default_factory=list)
-    pending_action: Literal["search", "retrieve"] | None = None
+    pending_action: Literal["search", "retrieve", "registration"] | None = None
     pending_query: str | None = None
     orchestration_mode: Literal["standard", "super"] = "standard"
     super_agent_stop_reason: str | None = None
@@ -165,6 +165,51 @@ class SearchCacheRecord(BaseModel):
     expanded_query: str
     fetched_at: str = Field(default_factory=utc_now_iso)
     results: list[SearchHit] = Field(default_factory=list)
+
+
+RegistrationFieldName = Literal[
+    "full_name",
+    "email",
+    "location",
+    "program_interest",
+    "discovery_source",
+    "degree_level",
+    "desired_start_date",
+]
+
+
+class RegistrationAnswersRecord(BaseModel):
+    full_name: str | None = None
+    email: str | None = None
+    location: str | None = None
+    program_interest: str | None = None
+    discovery_source: str | None = None
+    degree_level: str | None = None
+    desired_start_date: str | None = None
+
+
+class RegistrationRecommendationRecord(BaseModel):
+    program_name: str
+    message: str
+    source_mode: Literal["super", "search", "retrieve", "rules"]
+    citations: list[CitationRecord] = Field(default_factory=list)
+
+
+class RegistrationSessionRecord(BaseModel):
+    conversation_id: str
+    current_field: RegistrationFieldName = "full_name"
+    language: Literal["en", "fr"] = "en"
+    answers: RegistrationAnswersRecord = Field(default_factory=RegistrationAnswersRecord)
+    created_at: str = Field(default_factory=utc_now_iso)
+    updated_at: str = Field(default_factory=utc_now_iso)
+
+
+class RegistrationSubmissionRecord(BaseModel):
+    id: str
+    conversation_id: str
+    answers: RegistrationAnswersRecord
+    recommendation: RegistrationRecommendationRecord | None = None
+    submitted_at: str = Field(default_factory=utc_now_iso)
 
 
 SUPPORTED_GENERATION_MODELS = (

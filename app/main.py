@@ -36,6 +36,7 @@ def main() -> None:
             pdf_ingestion=services.pdf_ingestion,
             vector_store=services.vector_store,
             search_agent=services.search_agent,
+            registration_store=services.registration_store,
             agent_settings_store=services.agent_settings_store,
             default_generation_model=services.settings.gemini_model,
             default_embedding_model=services.settings.gemini_embedding_model,

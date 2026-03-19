@@ -11,6 +11,7 @@ from agents.retrieval import RetrievalAgent
 from agents.web_search import SiteSearchAgent
 from app.conversation_store import ConversationStore
 from app.models import AgentFeatureSettings
+from app.registration_store import RegistrationStore
 from app.settings import AppSettings
 from ingestion.pdf_ingestion import GoogleEmbeddingClient
 from ingestion.vector_store import LocalVectorStore
@@ -35,6 +36,10 @@ def build_live_orchestrator(
     feature_settings: AgentFeatureSettings,
 ) -> tuple[ConversationStore, OrchestratorAgent]:
     conversation_store = ConversationStore(Path(tmp_dir) / "conversations")
+    registration_store = RegistrationStore(
+        Path(tmp_dir) / "registrations" / "sessions",
+        Path(tmp_dir) / "registrations" / "submissions",
+    )
     vector_store = LocalVectorStore(Path("data/vector_store"))
     retrieval_agent = RetrievalAgent(
         vector_store=vector_store,
@@ -51,6 +56,7 @@ def build_live_orchestrator(
     )
     orchestrator = OrchestratorAgent(
         conversation_store=conversation_store,
+        registration_store=registration_store,
         search_agent=search_agent,
         retrieval_agent=retrieval_agent,
         llm_client=GoogleGeminiClient(

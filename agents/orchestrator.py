@@ -6,16 +6,74 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel
 
+from agents.registration import RegistrationAgent
 from agents.super_agent import SuperAgent
 from app.agent_settings import AgentFeatureSettingsStore
 from app.conversation_store import ConversationStore
 from app.models import AgentFeatureSettings, CitationRecord, MessageRecord, RetrievalHit, SearchHit
+from app.registration_store import RegistrationStore
 
 SYSTEM_PROMPT = """You are the ESILV Smart Assistant for a local demo.
 Reply in the same language as the user's latest message.
 Be concise, helpful, and explicit when information comes from ESILV sources.
 Do not invent ESILV facts. If the context is weak or missing, say so clearly.
+You must answer in the same language as the user's last question.
 """
+FRENCH_LANGUAGE_MARKERS = {
+    "bonjour",
+    "merci",
+    "je",
+    "j",
+    "tu",
+    "vous",
+    "pouvez",
+    "pouvez-vous",
+    "votre",
+    "vos",
+    "quel",
+    "quelle",
+    "quelles",
+    "quels",
+    "comment",
+    "pourquoi",
+    "expliquer",
+    "expliquez",
+    "est",
+    "suis",
+    "avec",
+    "dans",
+    "pour",
+    "les",
+    "des",
+    "une",
+    "un",
+    "inscription",
+    "candidature",
+    "rejoindre",
+    "etudier",
+    "ecole",
+}
+ENGLISH_LANGUAGE_MARKERS = {
+    "hello",
+    "hi",
+    "thanks",
+    "thank",
+    "please",
+    "what",
+    "which",
+    "when",
+    "where",
+    "how",
+    "why",
+    "can",
+    "could",
+    "would",
+    "should",
+    "join",
+    "study",
+    "apply",
+    "school",
+}
 DIRECT_STARTERS = ("hello", "hi", "hey", "thanks", "thank you", "bonjour", "salut", "merci")
 RETRIEVE_KEYWORDS = (
     "pdf",
@@ -220,6 +278,7 @@ class OrchestratorAgent:
     def __init__(
         self,
         conversation_store: ConversationStore,
+        registration_store: RegistrationStore,
         search_agent: SearchAgentProtocol,
         retrieval_agent: RetrievalAgentProtocol,
         llm_client: LlmClientProtocol,
@@ -249,21 +308,57 @@ class OrchestratorAgent:
             is_search_intent=self._is_search_intent,
             has_independent_search_intent=self._has_independent_search_intent,
         )
+        self.registration_agent = RegistrationAgent(
+            registration_store=registration_store,
+            search_agent=search_agent,
+            retrieval_agent=retrieval_agent,
+            llm_client=llm_client,
+            super_agent=self.super_agent,
+            max_search_hits=max_search_hits,
+            looks_french=self._looks_french,
+            search_is_weak=self._search_is_weak,
+            citations_from_hits=self._citations_from_hits,
+            citations_from_retrieval_hits=self._citations_from_retrieval_hits,
+            retrieval_answer_builder=self._retrieval_answer,
+            search_answer_builder=self._grounded_answer,
+        )
 
     def handle_turn(self, conversation_id: str, user_text: str) -> MessageRecord:
         user_message = MessageRecord(role="user", content=user_text)
         self.conversation_store.append_message(conversation_id, user_message)
         conversation = self.conversation_store.load(conversation_id)
 
+        feature_settings = self.feature_settings_store.load()
+        registration_message = self.registration_agent.continue_session(
+            conversation_id=conversation_id,
+            messages=conversation.messages,
+            user_text=user_text,
+            feature_settings=feature_settings,
+        )
+        if registration_message is not None:
+            self.conversation_store.append_message(conversation_id, registration_message)
+            return registration_message
+
+        if self.registration_agent.should_start_from_follow_up(conversation.messages, user_text):
+            assistant_message = self.registration_agent.start_session(conversation_id, user_text)
+            self.conversation_store.append_message(conversation_id, assistant_message)
+            return assistant_message
+
+        if self.registration_agent.should_start_immediately(user_text):
+            assistant_message = self.registration_agent.start_session(conversation_id, user_text)
+            self.conversation_store.append_message(conversation_id, assistant_message)
+            return assistant_message
+
         if not self.llm_client.configured:
             assistant_message = MessageRecord(
                 role="assistant",
                 content=self._config_missing_message(user_text),
             )
+            if self.registration_agent.should_offer_registration(user_text, assistant_message):
+                assistant_message = self.registration_agent.append_registration_cta(assistant_message, user_text)
             self.conversation_store.append_message(conversation_id, assistant_message)
             return assistant_message
 
-        feature_settings = self.feature_settings_store.load()
         decision = self._follow_up_decision(conversation.messages, user_text, feature_settings) or self._route(
             conversation.messages,
             user_text,
@@ -295,6 +390,9 @@ class OrchestratorAgent:
                 role="assistant",
                 content=self._temporary_failure_message(user_text),
             )
+
+        if self.registration_agent.should_offer_registration(user_text, assistant_message):
+            assistant_message = self.registration_agent.append_registration_cta(assistant_message, user_text)
 
         self.conversation_store.append_message(conversation_id, assistant_message)
         return assistant_message
@@ -351,16 +449,22 @@ class OrchestratorAgent:
             return self._heuristic_route(messages, user_text, feature_settings)
 
     def _direct_answer(self, messages: list[MessageRecord], user_text: str) -> str:
+        required_language = self._response_language(user_text)
         prompt = (
             f"Conversation:\n{self._format_messages(messages[-8:])}\n\n"
             f"Latest user message:\n{user_text}\n\n"
+            f"Required answer language: {required_language}.\n"
             "Answer directly from the conversation and general knowledge only. Do not claim that "
             "you checked the ESILV website or uploaded documents unless source snippets were "
             "provided. If you are unsure, say so clearly and ask for clarification if needed."
         )
-        return self.llm_client.generate_text(prompt=prompt, system_instruction=SYSTEM_PROMPT)
+        return self.llm_client.generate_text(
+            prompt=prompt,
+            system_instruction=self._answer_system_prompt(user_text),
+        )
 
     def _grounded_answer(self, messages: list[MessageRecord], user_text: str, hits: list[SearchHit]) -> str:
+        required_language = self._response_language(user_text)
         sources = "\n\n".join(
             f"Source {index + 1}\nTitle: {hit.title}\nURL: {hit.url}\nSnippet: {hit.snippet}"
             for index, hit in enumerate(hits[: self.max_search_hits])
@@ -368,11 +472,16 @@ class OrchestratorAgent:
         prompt = (
             f"Conversation:\n{self._format_messages(messages[-8:])}\n\n"
             f"Latest user message:\n{user_text}\n\n"
+            f"Required answer language: {required_language}.\n"
+            f"If the source snippets are in another language, translate or summarize them into {required_language}.\n"
             "Use only the source snippets below to answer. If they do not fully answer the "
             "question, state the limitation and do not invent details.\n\n"
             f"{sources}"
         )
-        return self.llm_client.generate_text(prompt=prompt, system_instruction=SYSTEM_PROMPT)
+        return self.llm_client.generate_text(
+            prompt=prompt,
+            system_instruction=self._answer_system_prompt(user_text),
+        )
 
     def _hybrid_answer(
         self,
@@ -381,6 +490,7 @@ class OrchestratorAgent:
         retrieval_hits: list[RetrievalHit],
         search_hits: list[SearchHit],
     ) -> str:
+        required_language = self._response_language(user_text)
         retrieval_sources = "\n\n".join(
             (
                 f"Document source {index + 1}\n"
@@ -397,13 +507,18 @@ class OrchestratorAgent:
         prompt = (
             f"Conversation:\n{self._format_messages(messages[-8:])}\n\n"
             f"Latest user message:\n{user_text}\n\n"
+            f"Required answer language: {required_language}.\n"
+            f"If the source snippets are in another language, translate or summarize them into {required_language}.\n"
             "Use only the document and web source snippets below to answer. Compare the current draft "
             "against the entire user question. If any part remains unsupported or missing, say so clearly "
             "and do not invent details.\n\n"
             f"Uploaded-document snippets:\n{retrieval_sources or '(none)'}\n\n"
             f"ESILV website snippets:\n{search_sources or '(none)'}"
         )
-        return self.llm_client.generate_text(prompt=prompt, system_instruction=SYSTEM_PROMPT)
+        return self.llm_client.generate_text(
+            prompt=prompt,
+            system_instruction=self._answer_system_prompt(user_text),
+        )
 
     def _retrieval_answer(
         self,
@@ -411,6 +526,7 @@ class OrchestratorAgent:
         user_text: str,
         hits: list[RetrievalHit],
     ) -> str:
+        required_language = self._response_language(user_text)
         sources = "\n\n".join(
             (
                 f"Source {index + 1}\n"
@@ -423,11 +539,16 @@ class OrchestratorAgent:
         prompt = (
             f"Conversation:\n{self._format_messages(messages[-8:])}\n\n"
             f"Latest user message:\n{user_text}\n\n"
+            f"Required answer language: {required_language}.\n"
+            f"If the source snippets are in another language, translate or summarize them into {required_language}.\n"
             "Use only the uploaded-document snippets below to answer. If they do not fully answer "
             "the question, state the limitation and do not invent details.\n\n"
             f"{sources}"
         )
-        return self.llm_client.generate_text(prompt=prompt, system_instruction=SYSTEM_PROMPT)
+        return self.llm_client.generate_text(
+            prompt=prompt,
+            system_instruction=self._answer_system_prompt(user_text),
+        )
 
     def _execute_single_pass(
         self,
@@ -696,13 +817,24 @@ class OrchestratorAgent:
     @staticmethod
     def _looks_french(text: str) -> bool:
         lowered = text.lower()
+        if any(character in lowered for character in "àâçéèêëîïôùûüÿœæ"):
+            return True
         tokens = {
             token.strip(".,!?;:()[]{}'\"")
             for token in lowered.split()
             if token.strip(".,!?;:()[]{}'\"")
         }
-        markers = {"bonjour", "merci", "admission", "programme", "cours", "inscription", "ecole"}
-        return bool(tokens & markers)
+        french_hits = len(tokens & FRENCH_LANGUAGE_MARKERS)
+        english_hits = len(tokens & ENGLISH_LANGUAGE_MARKERS)
+        if french_hits == english_hits == 0:
+            return False
+        return french_hits > english_hits
+
+    def _response_language(self, user_text: str) -> str:
+        return "French" if self._looks_french(user_text) else "English"
+
+    def _answer_system_prompt(self, user_text: str) -> str:
+        return f"{SYSTEM_PROMPT}\nRequired response language: {self._response_language(user_text)}."
 
     @staticmethod
     def _is_affirmative_reply(text: str) -> bool:

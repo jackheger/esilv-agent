@@ -7,6 +7,7 @@ import streamlit as st
 from agents.web_search import SiteSearchAgent
 from app.agent_settings import AgentFeatureSettingsStore
 from app.models import AgentFeatureSettings, SUPPORTED_EMBEDDING_MODELS, SUPPORTED_GENERATION_MODELS
+from app.registration_store import RegistrationStore
 from ingestion.pdf_ingestion import PdfIngestionService
 from ingestion.uploads import UploadRegistry
 from ingestion.vector_store import LocalVectorStore
@@ -17,6 +18,7 @@ def render_admin_page(
     pdf_ingestion: PdfIngestionService,
     vector_store: LocalVectorStore,
     search_agent: SiteSearchAgent,
+    registration_store: RegistrationStore,
     agent_settings_store: AgentFeatureSettingsStore,
     default_generation_model: str,
     default_embedding_model: str,
@@ -25,7 +27,7 @@ def render_admin_page(
     st.caption("Manage ingestion, indexed documents, website cache, and agent behavior.")
     section = st.radio(
         "Admin section",
-        options=["Ingestion", "Agent parameters"],
+        options=["Ingestion", "Agent parameters", "Application Forms"],
         key="admin_section",
         horizontal=True,
         label_visibility="collapsed",
@@ -37,6 +39,10 @@ def render_admin_page(
             default_generation_model=default_generation_model,
             default_embedding_model=default_embedding_model,
         )
+        return
+
+    if section == "Application Forms":
+        _render_application_forms_section(registration_store)
         return
 
     _render_ingestion_section(upload_registry, pdf_ingestion, vector_store, search_agent)
@@ -264,3 +270,30 @@ def _render_cache_section(search_agent: SiteSearchAgent) -> None:
         st.markdown("**Recent cached URLs**")
         for url in stats.urls:
             st.markdown(f"- {url}")
+
+
+def _render_application_forms_section(registration_store: RegistrationStore) -> None:
+    st.markdown("### Application Forms")
+    st.caption("Review completed registration forms submitted through the conversational registration agent.")
+
+    submissions = registration_store.list_submissions()
+    st.metric("Submitted forms", len(submissions))
+    if not submissions:
+        st.caption("No registration forms have been submitted yet.")
+        return
+
+    for submission in submissions:
+        full_name = submission.answers.full_name or "Unnamed student"
+        email = submission.answers.email or "No email"
+        label = f"{full_name} · {email} · {submission.submitted_at}"
+        with st.expander(label, expanded=False):
+            st.markdown(f"**Name:** {submission.answers.full_name or '-'}")
+            st.markdown(f"**Email:** {submission.answers.email or '-'}")
+            st.markdown(f"**Location:** {submission.answers.location or '-'}")
+            st.markdown(f"**Program interest:** {submission.answers.program_interest or '-'}")
+            st.markdown(f"**Discovery source:** {submission.answers.discovery_source or '-'}")
+            st.markdown(f"**Degree level:** {submission.answers.degree_level or '-'}")
+            st.markdown(f"**Desired start date:** {submission.answers.desired_start_date or '-'}")
+            if submission.recommendation is not None:
+                st.markdown("**Recommendation**")
+                st.markdown(submission.recommendation.message)

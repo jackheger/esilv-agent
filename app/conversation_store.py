@@ -14,14 +14,22 @@ class ConversationStore:
         self.conversations_dir.mkdir(parents=True, exist_ok=True)
 
     def list(self) -> list[ConversationRecord]:
-        records: list[ConversationRecord] = []
+        records_with_ordering: list[tuple[ConversationRecord, int]] = []
         for path in self.conversations_dir.glob("*.json"):
             try:
-                records.append(ConversationRecord.model_validate_json(path.read_text("utf-8")))
+                record = ConversationRecord.model_validate_json(path.read_text("utf-8"))
             except (OSError, ValueError):
                 continue
-        records.sort(key=lambda record: record.updated_at, reverse=True)
-        return records
+            try:
+                modified_at_ns = path.stat().st_mtime_ns
+            except OSError:
+                modified_at_ns = 0
+            records_with_ordering.append((record, modified_at_ns))
+        records_with_ordering.sort(
+            key=lambda item: (item[0].updated_at, item[1]),
+            reverse=True,
+        )
+        return [record for record, _ in records_with_ordering]
 
     def exists(self, conversation_id: str) -> bool:
         return self._conversation_path(conversation_id).exists()

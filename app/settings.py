@@ -69,6 +69,18 @@ class AppSettings(BaseSettings):
     def agent_settings_path(self) -> Path:
         return self.app_data_dir / "agent_settings.json"
 
+    @property
+    def registrations_dir(self) -> Path:
+        return self.app_data_dir / "registrations"
+
+    @property
+    def registration_sessions_dir(self) -> Path:
+        return self.registrations_dir / "sessions"
+
+    @property
+    def registration_submissions_dir(self) -> Path:
+        return self.registrations_dir / "submissions"
+
     def ensure_directories(self) -> None:
         self.app_data_dir.mkdir(parents=True, exist_ok=True)
         self.conversations_dir.mkdir(parents=True, exist_ok=True)
@@ -77,3 +89,6 @@ class AppSettings(BaseSettings):
         self.upload_files_dir.mkdir(parents=True, exist_ok=True)
         self.vector_store_dir.mkdir(parents=True, exist_ok=True)
         self.docling_artifacts_dir.mkdir(parents=True, exist_ok=True)
+        self.registrations_dir.mkdir(parents=True, exist_ok=True)
+        self.registration_sessions_dir.mkdir(parents=True, exist_ok=True)
+        self.registration_submissions_dir.mkdir(parents=True, exist_ok=True)

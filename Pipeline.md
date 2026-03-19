@@ -5,11 +5,12 @@ This document describes the current runtime orchestration pipeline implemented i
 Two important framing points:
 
 1. There is no separate backend API server. The application entrypoint is the Streamlit script in `app/main.py`.
-2. The system currently has four runtime answer paths:
+2. The system currently has five runtime answer paths:
    - `direct`: Gemini answers without retrieval
    - `retrieve`: local PDF RAG over the JSON-backed vector store
    - `search`: ESILV website search via Tavily plus a local query cache
    - `super`: an iterative orchestration layer over `retrieve`, `search`, or `hybrid` when `super_agent_enabled` is on
+   - `registration`: an LLM-guided, stateful lead-capture flow that persists application forms under `data/registrations/`
 
 ## Observed Runtime State
 
@@ -50,6 +51,8 @@ Major components:
   - `ui/admin_page.py:render_admin_page`
 - Orchestration:
   - `agents/orchestrator.py:OrchestratorAgent`
+- Conversational registration:
+  - `agents/registration.py:RegistrationAgent`
 - RAG retrieval:
   - `agents/retrieval.py:RetrievalAgent`
   - `ingestion/pdf_ingestion.py:PdfIngestionService`
@@ -58,6 +61,7 @@ Major components:
   - `agents/web_search.py:SiteSearchAgent`
 - Persistence:
   - `app/conversation_store.py:ConversationStore`
+  - `app/registration_store.py:RegistrationStore`
   - `app/agent_settings.py:AgentFeatureSettingsStore`
   - `ingestion/uploads.py:UploadRegistry`
   - `ingestion/vector_store.py:LocalVectorStore`
@@ -73,6 +77,7 @@ Major components:
 `app/runtime.py:build_services` constructs the full object graph on each Streamlit run:
 
 - `ConversationStore`
+- `RegistrationStore`
 - `AgentFeatureSettingsStore`
 - `UploadRegistry`
 - `LocalVectorStore`
@@ -101,6 +106,8 @@ There is no HTTP API or FastAPI/Flask service. The effective "entrypoint" for us
 The app uses JSON files, not a database:
 
 - Conversations: `data/conversations/<conversation_id>.json`
+- Active registration sessions: `data/registrations/sessions/<conversation_id>.json`
+- Completed registration submissions: `data/registrations/submissions/<submission_id>.json`
 - Agent feature flags: `data/agent_settings.json`
 - Uploaded PDF registry: `data/uploads/registry.json`
 - Raw uploaded PDFs: `data/uploads/files/<uuid>.pdf`
@@ -156,24 +163,29 @@ Runtime behavior:
 4. `handle_turn` reloads the full conversation from disk with `ConversationStore.load`.
 5. If Gemini is not configured (`llm_client.configured` is false), the method returns a configuration error message immediately and does not attempt routing, retrieval, or search.
 6. The orchestrator loads global feature flags from `app/agent_settings.py:AgentFeatureSettingsStore.load`.
-7. Routing occurs in `OrchestratorAgent._route(messages, user_text, feature_settings)`.
-8. `_route` first short-circuits to `direct` if both `rag_enabled` and `web_search_enabled` are false.
-9. Otherwise `_route` attempts an LLM-based structured routing decision using Gemini (`GoogleGeminiClient.generate_structured`) with schema `RoutingDecision`.
-10. If structured routing fails for any reason, `_route` falls back to `OrchestratorAgent._heuristic_route`.
-11. The route is normalized against enabled features by `_normalize_decision`. If the LLM selected a disabled action, `_fallback_for_disabled_action` coerces the route to either another tool or `direct`.
-12. Back in `handle_turn`, direct requests still go straight to `_direct_answer`.
-13. When `super_agent_enabled` is false and both RAG and web search are enabled, standard mode uses a deterministic hybrid path:
+7. Before normal routing, the orchestrator checks `RegistrationAgent`:
+   - active registration sessions consume the turn immediately
+   - explicit contact / joining / study-interest / program-choice intents start a new registration session immediately
+   - affirmative replies to a prior registration CTA start the session
+8. If none of those registration conditions match, routing occurs in `OrchestratorAgent._route(messages, user_text, feature_settings)`.
+9. `_route` first short-circuits to `direct` if both `rag_enabled` and `web_search_enabled` are false.
+10. Otherwise `_route` attempts an LLM-based structured routing decision using Gemini (`GoogleGeminiClient.generate_structured`) with schema `RoutingDecision`.
+11. If structured routing fails for any reason, `_route` falls back to `OrchestratorAgent._heuristic_route`.
+12. The route is normalized against enabled features by `_normalize_decision`. If the LLM selected a disabled action, `_fallback_for_disabled_action` coerces the route to either another tool or `direct`.
+13. Back in `handle_turn`, direct requests still go straight to `_direct_answer`.
+14. When `super_agent_enabled` is false and both RAG and web search are enabled, standard mode uses a deterministic hybrid path:
     - run `RetrievalAgent.search` and `SiteSearchAgent.search` in the same turn
     - if both are useful -> synthesize a hybrid answer from document and web snippets
     - if only one side is useful -> answer from that stronger source only
     - if both are weak -> return the search clarification flow with an optional `pending_query`
-14. When only one external tool is enabled, standard mode uses only that tool and returns its normal answer or clarification behavior.
-15. When `super_agent_enabled` is true and the route is non-direct, control is delegated to `SuperAgent.run(...)`.
-15. If the user later replies with an affirmative follow-up such as `yes` and the previous assistant message carried a `pending_action` + `pending_query`, `_follow_up_decision(...)` bypasses normal routing and reruns the suggested tool/query directly.
-16. Any exception inside the selected branch is caught by `handle_turn`, which returns `_temporary_failure_message(...)`.
-17. The assistant response is appended to the conversation JSON via `ConversationStore.append_message`.
-18. Control returns to `ui/chat_page.py`, which calls `st.rerun()`.
-19. Streamlit rerenders the conversation and displays the new assistant message and its citations.
+15. When only one external tool is enabled, standard mode uses only that tool and returns its normal answer or clarification behavior.
+16. When `super_agent_enabled` is true and the route is non-direct, control is delegated to `SuperAgent.run(...)`.
+17. If the user later replies with an affirmative follow-up such as `yes` and the previous assistant message carried a `pending_action` + `pending_query`, `_follow_up_decision(...)` bypasses normal routing and reruns the suggested tool/query directly.
+18. After a normal admissions/program-discovery answer, the orchestrator may append a registration CTA with `pending_action="registration"` so the next `yes` can start the form.
+19. Any exception inside the selected branch is caught by `handle_turn`, which returns `_temporary_failure_message(...)`.
+20. The assistant response is appended to the conversation JSON via `ConversationStore.append_message`.
+21. Control returns to `ui/chat_page.py`, which calls `st.rerun()`.
+22. Streamlit rerenders the conversation and displays the new assistant message and its citations.
 
 ### 2.2 Mermaid sequence diagram
 
@@ -951,6 +963,9 @@ It runs a set of warmup queries defined in `DEFAULT_WARMUP_QUERIES`, currently 6
 - `agents/orchestrator.py`
   - Purpose: route selection, answer synthesis, failure handling
   - Symbols: `SYSTEM_PROMPT`, `RoutingDecision`, `GoogleGeminiClient`, `OrchestratorAgent`
+- `agents/registration.py`
+  - Purpose: LLM-guided conversational registration flow, deterministic state tracking, and recommendation fallback
+  - Symbols: `RegistrationAgent`
 - `agents/retrieval.py`
   - Purpose: local vector retrieval and hit scoring
   - Symbols: `RetrievalAgent`, `tokenize`, `snippet_for`
@@ -976,6 +991,9 @@ It runs a set of warmup queries defined in `DEFAULT_WARMUP_QUERIES`, currently 6
 - `app/conversation_store.py`
   - Purpose: conversation persistence
   - Symbols: `ConversationStore`
+- `app/registration_store.py`
+  - Purpose: registration-session and application-form persistence
+  - Symbols: `RegistrationStore`
 - `app/agent_settings.py`
   - Purpose: global feature flag persistence
   - Symbols: `AgentFeatureSettingsStore`
@@ -1003,11 +1021,12 @@ It runs a set of warmup queries defined in `DEFAULT_WARMUP_QUERIES`, currently 6
   - Purpose: chat rendering and request submission
   - Symbols: `render_chat_page`
 - `ui/admin_page.py`
-  - Purpose: PDF ingestion controls, cache controls, feature toggles
+  - Purpose: PDF ingestion controls, cache controls, feature toggles, application-form review
   - Symbols:
     - `render_admin_page`
     - `_render_ingestion_section`
     - `_render_agent_parameters_section`
+    - `_render_application_forms_section`
     - `_render_upload_section`
     - `_render_cache_section`
 - `ui/components.py`

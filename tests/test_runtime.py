@@ -26,6 +26,8 @@ def test_build_services_uses_admin_selected_models(tmp_path):
     assert services.orchestrator.llm_client.model == "gemini-2.5-pro"
     assert services.pdf_ingestion.embedding_client.model == "gemini-embedding-2-preview"
     assert services.retrieval_agent.embedding_client.model == "gemini-embedding-2-preview"
+    assert services.registration_store.sessions_dir == settings.registration_sessions_dir
+    assert services.registration_store.submissions_dir == settings.registration_submissions_dir
 
 
 def test_build_services_falls_back_to_env_models_when_admin_selection_missing(tmp_path):
@@ -47,3 +49,4 @@ def test_build_services_falls_back_to_env_models_when_admin_selection_missing(tm
 
     assert services.orchestrator.llm_client.model == "gemini-2.5-flash-lite"
     assert services.pdf_ingestion.embedding_client.model == "gemini-embedding-2-preview"
+    assert services.registration_store.sessions_dir == settings.registration_sessions_dir
